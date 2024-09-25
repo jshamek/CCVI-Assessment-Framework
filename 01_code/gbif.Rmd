@@ -1,0 +1,247 @@
+---
+title: "GBIF"
+author: "Jess Nettle Shamek"
+date: "2024-08-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(usethis)
+library(rgbif)
+library(sf)
+library(sp)
+library(ggplot2)
+library(raster)
+library(dplyr)
+library(CoordinateCleaner)
+library(here)
+```
+
+```{r}
+code_dir    <- "01_code"
+raw_data    <- "02_raw-data"
+data_dir    <- "03_clean-data"
+results_dir <- "04_results"
+```
+
+# Introduction
+This analysis is for making species distribution shape files from GBIF data. The steps include making an ecoregion shape file and then downloading the species occurrence points. GBIF point data has to be filtered then points are buffered, turned into polygons, and joined before being exported as a shape file.This shape file is then used as the species range shapefile for CCVI assessments using the CCVI package in R.
+
+## Making a Shape File of the ecoregion
+First, get the shape file of all Oregon ecoregions provided by the fed (EPA).
+```{r}
+ecoregion <- st_read(here(raw_data,"Ecoregion Shapefile/or_eco_l3.shp"))
+``` 
+
+Next, filter it to the specific ecoregion.
+```{r}
+specific_ecoregion <- ecoregion[ecoregion$US_L3NAME == "Willamette Valley", ]
+specific_ecoregion <- st_transform(specific_ecoregion, crs = 4326)
+#polygon_sf <- st_as_sfc(specific_ecoregion, crs = 4326)
+#st_is_valid(polygon_sf)
+```
+
+Here, we write out the ecoregion shape file for using as the assessment area polygon in the CCVI assessment.
+```{r}
+st_write(specific_ecoregion, here(data_dir,"WV.shp"))
+```
+
+
+## Getting Species Data From GBIF
+Next, get the species data. This process can be done for each species but you must change the species name (taxon key) and shape file name.
+
+First we log in to GBIF. You have to restart R after you enter you credentials. 
+```{r}
+#usethis::edit_r_environ()
+```
+
+Next we download the data based on a taxon key and shape file. We have to simplify the shapefileinto a wkt text string.
+```{r}
+specific_ecoregion_wkt <- st_as_text(st_union(st_geometry(specific_ecoregion)))
+```
+
+Then we can get the taxon key and download the data.
+```{r}
+taxonkey <- name_backbone("Tsuga heterophylla")$usageKey
+  
+
+gbif_download <- occ_download(
+    pred("taxonKey", taxonkey),
+    pred("hasCoordinate", TRUE), 
+    pred("hasGeospatialIssue", FALSE), 
+    pred_within(specific_ecoregion_wkt), # This is the spatial filter
+    format = "SIMPLE_CSV"
+  )
+  
+
+occ_download_wait(gbif_download)
+glimpse(gbif_download)
+```
+
+Download the file and import it into a data frame.
+```{r}
+download_file <- occ_download_get(gbif_download, path = here(raw_data,".")) # To change the name of the download to something meaningful you can change "." to "TSUHET_WV" or something similar
+
+df <- occ_download_import(download_file)
+
+colnames(df)
+```
+
+
+### The GBIF Data Need to be Filtered.
+Before we make a shape file, we have to process the data with a filtering pipeline. This filters by collection year, removes fossil specimens, filters by coordinate uncertainty and removes duplicates. 
+```{r}
+ filtered_data <- df %>%
+  filter(year >= 1900) %>%  
+  filter(!basisOfRecord %in% c("FOSSIL_SPECIMEN")) %>% 
+  filter(coordinateUncertaintyInMeters < 10000) %>% 
+  distinct(decimalLongitude, decimalLatitude, speciesKey, datasetKey, .keep_all = TRUE) %>%  
+  glimpse()
+```
+
+
+## Creating a Polygon from Occurance Points
+Convert the filtered data into an sf object with a CRS.
+```{r}
+filtered_sf <- st_as_sf(filtered_data, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+```
+
+Check the points by plotting using ggplot.
+```{r}
+ggplot() +
+  geom_sf(data = specific_ecoregion, fill = "lightgreen", color = "darkgreen", alpha = 0.4) +  
+  geom_sf(data = filtered_sf, color = "blue", size = 1) +  
+  theme_minimal() +
+  labs(title = "Species Occurrences within WV",
+       x = "Longitude", 
+       y = "Latitude")
+```
+
+Create a buffer around the points so you can make a polygon.
+```{r}
+buffer_distance <- 5000  
+species_buffer <- st_buffer(filtered_sf, dist = buffer_distance)
+```
+
+Join the polygons.
+```{r}
+species_range_polygon <- st_union(species_buffer)
+```
+
+Try to reduce the complexity.
+```{r}
+species_range_polygon <- st_make_valid(species_range_polygon)
+species_range_polygon<- st_simplify(species_range_polygon, dTolerance = 100)
+```
+
+Clip the new species range polygon to the ecoregion because the buffer could extend past the ecoregion.
+```{r}
+species_range_polygon <- st_intersection(species_range_polygon, specific_ecoregion)
+```
+
+
+Same CRS for the Willamette Valley.
+```{r}
+species_crs <- st_crs(species_range_polygon)
+ecoregion_crs <- st_crs(specific_ecoregion)
+
+if (species_crs != ecoregion_crs) {
+  specific_ecoregion <- st_transform(specific_ecoregion, species_crs)
+}
+```
+
+Plotting the Willamette Valley.
+```{r}
+ggplot() +
+  geom_sf(data = specific_ecoregion, fill = "lightgreen", color = "darkgreen", alpha = 0.4) +  
+  geom_sf(data = species_range_polygon, fill = "lightblue", color = "blue", size = 1) +  
+  theme_minimal() +
+  labs(title = "Species Range within WV",
+       x = "Longitude", 
+       y = "Latitude")
+```
+
+## Save WV range as a shapefile.
+```{r}
+st_write(species_range_polygon, here(data_dir,"Tsugadistribution.shp"), append=FALSE)
+```
+
+
+## Extra Code:
+
+### This code is for testing the download from gbif using occ_search(). occ_download() should be used for research.
+```{r}
+species_data <- occ_search(scientificName = "Tsuga heterophylla", fields = c("key", "decimalLatitude", "decimalLongitude"), limit = 2000)
+```
+
+```{r}
+data <- species_data$data
+species_sf <- st_as_sf(data, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+```
+
+### This code if for clipping the species occurance to the ecoregion. We filtered by polygon during the download to avoid this step.
+
+Clip it to the Willamette Valley.
+```{r}
+clipped_species_range <- st_intersection(species_range_polygon, specific_ecoregion)
+```
+
+Clip it to Oregon for comparison.
+```{r}
+state_species_range <- st_intersection(species_range_polygon, ecoregion)
+```
+
+Now same CRS for the whole state.
+```{r}
+state_ecoregion_crs <- st_crs(ecoregion)
+
+if (species_crs != state_ecoregion_crs) {
+  ecoregion <- st_transform(ecoregion, species_crs)
+}
+```
+
+### This code if for plotting the range on a temp raster.
+
+```{r}
+temp_annual <- raster("C:/Users/shamekj/Desktop/R Docs/CCVI/Climate ASCII/HistTempVarC.img")
+
+ecoregion_temp_mask <- rasterize(specific_ecoregion, temp_annual, field = 1)
+
+temp_clipped <- mask(temp_annual, ecoregion_temp_mask)
+```
+
+```{r}
+ecoregion_extent <- st_bbox(specific_ecoregion)
+# Plot the raster
+plot(temp_clipped, main = "Temperature and Species Range", col = terrain.colors(100), ext = ecoregion_extent)
+
+# Add the species range
+plot(st_geometry(clipped_species_range), add = TRUE, col = "red", border = "black")
+```
+
+### This code is for comparing the whole state.
+Plotting Oregon range.
+```{r}
+state_temp_mask <- rasterize(ecoregion, temp_annual, field = 1)
+
+state_temp_clipped <- mask(temp_annual, state_temp_mask)
+```
+
+```{r}
+state_extent <- st_bbox(ecoregion)
+
+plot(state_temp_clipped, main = "Temperature and Species Range", col = terrain.colors(100), ext = state_extent)
+
+# Add the species range
+plot(st_geometry(state_species_range), add = TRUE, col = "red", border = "black")
+```
+
+Save state range as a shapefile.
+```{r}
+st_write(state_species_range, "Tsuga_distribution_state.shp")
+```
+

@@ -1,0 +1,26 @@
+---
+title: "ccvi assessment"
+author: "Jess Nettle"
+date: "2024-08-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+devtools::install_github("LandSciTech/ccviR")
+```
+
+```{r}
+library(ccviR)
+library(here)
+```
+
+
+Run Demo
+```{r}
+run_ccvi_app()
+```
+
