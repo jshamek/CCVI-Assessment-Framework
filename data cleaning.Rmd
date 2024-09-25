@@ -1,0 +1,475 @@
+---
+title: "CCVI Data Cleaning"
+author: "Jess Nettle"
+date: "2024-08-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(tidyr)
+library(here)
+library(purrr)
+library(sf)
+library(ggplot2)
+library(raster)
+library(dplyr)
+library(RColorBrewer)
+```
+
+NOTE: These data required cleaning by hand unfortunately. These are pre-cleaned .csv files. 
+Required file headers for each .csv:
+Herbarium, Scientific Name, Year Collected, County, Locality, Site Description, Decimal Latitude, Decimal Longitude.
+
+
+Set a file directory for all the species data.
+```{r}
+file_dir <- "C:/Users/shamekj/Desktop/R Docs/CCVI/species_data"
+```
+
+Create a list of files.
+```{r}
+my_files <- list.files(file_dir,pattern="*.csv", full.names = TRUE)
+```
+
+Merge the files into a single dataframe.
+```{r}
+data <- my_files %>%
+  map_df(~read.csv(.x)%>%
+           mutate(file_name = basename(.x)))
+```
+
+```{r}
+str(data)
+```
+We need to clean up the old genus names since we're using genus to calculate occurance area in climate rasters.
+```{r}
+data <- data %>%
+  mutate(Genus = case_when(
+    Genus == "Frangula" ~ "Rhamnus",
+    Genus == "Berberis" ~ "Mahonia",
+    TRUE ~ Genus  
+  ))
+```
+
+Now turn this into a spatial object.
+```{r}
+sf_data <- st_as_sf(data, coords = c("Decimal.Longitude", "Decimal.Latitude"), crs = 4326)
+```
+
+Plot the spatial object.
+```{r}
+ggplot(sf_data) +
+  geom_sf(aes(color = Genus)) +
+  theme_minimal() +
+  labs(title = "Specimen Collection Sites",
+       x = "Longitude", y = "Latitude")
+```
+Now let's load in the ecoregion shapefile.
+```{r}
+ecoregion <- st_read("C:/Users/shamekj/Desktop/R Docs/CCVI/Ecoregion Shapefile/or_eco_l3.shp")
+```
+
+Check the coordinate reference system of each object.
+```{r}
+st_crs(sf_data)
+```
+
+```{r}
+st_crs(ecoregion)
+```
+
+They are different so let's reproject the ecoregion to the points so that everything is in WGS84.
+```{r}
+ecoregion <- st_transform(ecoregion, st_crs(sf_data))
+```
+
+This ecoregion file has all ecoregions in Oregon so we need to find the Willamette Valley one.
+```{r}
+print(st_drop_geometry(ecoregion))
+```
+
+Can we filter to the specific Willamette Valley one?
+```{r}
+specific_ecoregion <- ecoregion[ecoregion$NA_L3NAME == "Willamette Valley", ]
+```
+
+Now, let's clip the occurrence data to the ecoregion and plot it.
+```{r}
+clipped_species_data <- st_intersection(sf_data, specific_ecoregion)
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = specific_ecoregion, fill = "lightgrey", color = "black") +  
+  geom_sf(data = clipped_species_data, aes(color = Genus)) +  
+  theme_minimal() +
+  labs(title = "Clipped Species Collection Sites",
+       x = "Longitude", y = "Latitude",
+       color = "Species")
+```
+
+Sweet. So we have clipped species occurrence data that we can analyze by genus. Now we need our climate rasters.
+```{r}
+temp_annual<- raster("C:/Users/shamekj/Desktop/R Docs/CCVI/Climate ASCII/TempFutC.img")
+moist_annual<- raster("C:/Users/shamekj/Desktop/R Docs/CCVI/Climate ASCII/MoistAnnual.img")
+temp_var <- raster("C:/Users/shamekj/Desktop/R Docs/CCVI/Climate ASCII/HistTempVarC.img")
+precip_var <- raster("C:/Users/shamekj/Desktop/R Docs/CCVI/Climate ASCII/HistPrecipmm.img")
+```
+
+Create a raster mask.
+```{r}
+ecoregion_temp_mask <- rasterize(specific_ecoregion, temp_annual, field = 1)
+ecoregion_precip_mask <- rasterize(specific_ecoregion, moist_annual, field = 1)
+ecoregion_tempvar_mask <- rasterize(specific_ecoregion, temp_var, field = 1)
+ecoregion_precipvar_mask <- rasterize(specific_ecoregion, precip_var, field = 1)
+```
+
+
+Clip climate rasters.
+```{r}
+temp_clipped <- mask(temp_annual, ecoregion_temp_mask)
+precip_clipped <- mask(moist_annual, ecoregion_precip_mask)
+temp_var_clipped <- mask(temp_var, ecoregion_tempvar_mask)
+precip_var_clipped <- mask(precip_var, ecoregion_precipvar_mask)
+```
+
+```{r}
+ecoregion_extent <- st_bbox(specific_ecoregion)
+plot(temp_clipped, main = "Predicted Temp Increase (C), Willamette Valley",ext = ecoregion_extent)
+plot(st_geometry(clipped_species_data), add = TRUE, col = 'red', pch = 16)
+```
+```{r}
+plot(precip_clipped, main = "Predicted Hamon AET:PET, Willamette Valley",ext = ecoregion_extent)
+plot(st_geometry(clipped_species_data), add = TRUE, col = 'red', pch = 16)
+```
+```{r}
+ecoregion_extent <- st_bbox(specific_ecoregion)
+plot(temp_var_clipped, main = "Historical Temp Variation (C), Willamette Valley",ext = ecoregion_extent)
+```
+
+```{r}
+ecoregion_extent <- st_bbox(specific_ecoregion)
+plot(precip_var_clipped, main = "Historical Precip Variation (mm), Willamette Valley",ext = ecoregion_extent)
+```
+
+Great. Now we need to get binned values for each species. We're using genus here instead of species epithet or scientific name because I am too lazy to clean up the species names and the genus's just happen to be unique. 
+
+Let's start with historical precip.
+```{r}
+ecoregion_extent <- st_bbox(specific_ecoregion)
+plot(precip_var_clipped, main = "Historical Precip Variation (mm), Willamette Valley",ext = ecoregion_extent)
+plot(st_geometry(clipped_species_data), add = TRUE, col = 'red', pch = 16)
+```
+
+Extract raster values at species occurrence points
+```{r}
+precip_var_values <- raster::extract(precip_var_clipped, clipped_species_data)
+```
+
+Attach precip data to original species list.
+```{r}
+clipped_species_data$precip_var_values <- precip_var_values
+```
+
+Use dplyr to organize min and max values into a new table and 
+```{r}
+species_values_table <- clipped_species_data %>%
+  as.data.frame() %>%
+  dplyr::select(Genus, precip_var_values)
+
+min_max_diff_table <- species_values_table %>%
+  group_by(Genus) %>%
+  summarize(
+    min_value = min(precip_var_values, na.rm = TRUE),
+    max_value = max(precip_var_values, na.rm = TRUE),
+    difference = max_value - min_value
+  )
+```
+
+
+Historical temp is going to look a bit different. We need to look at each individual species on a map and make a qualitative assessment. 
+
+Let's try ggplot for mapping.
+```{r}
+tvar.p <- rasterToPoints(temp_var_clipped)
+```
+
+```{r}
+df<-data.frame(tvar.p)
+colnames(df)<-c("Longitude", "Latitude", "tvar")
+```
+
+The species data is an sp object so we need to extract that to lat and long again.
+```{r}
+species_data <- clipped_species_data %>%
+  mutate(
+    Longitude = sf::st_coordinates(geometry)[, 1],
+    Latitude = sf::st_coordinates(geometry)[, 2]
+  )
+```
+
+Now we can plot each species on the raster using ggplot.
+```{r}
+ggplot(data=df, aes(y=Latitude, x=Longitude)) +
+  geom_raster(aes(fill=tvar)) +
+  geom_point(data=subset(species_data, Genus == "Salix"), aes(x=Longitude, y=Latitude), color="black", size=2, shape=20) +
+  theme_minimal() +
+  coord_equal() +
+ scale_fill_gradient(name="mean temp. var. (°C)", low="yellow", high = "red") +
+  ggtitle("Historical Temp. Variation, Salix lasiandra") +
+  theme(
+    axis.title.x = element_text(size=12),
+    axis.title.y = element_text(size=12, angle=90),
+    axis.text.x = element_text(size=12),
+    axis.text.y = element_text(size=12),
+     plot.background = element_rect(fill="white"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    legend.key = element_blank()
+  )
+```
+
+Now we need to add a column to the species data to bin and summarize the values of temperature variation.
+```{r}
+temp_var_values <- raster::extract(temp_var_clipped, clipped_species_data)
+clipped_species_data$temp_var_values <- temp_var_values
+clipped_species_data$temp_var_values <- as.integer(clipped_species_data$temp_var_values)
+```
+
+Remove NA's
+```{r}
+clipped_species_data <- clipped_species_data %>%
+  filter(!is.na(temp_var_values))
+```
+
+Create bins.
+```{r}
+clipped_species_data$temp_bin <- cut(
+  clipped_species_data$temp_var_values,
+  breaks = c(-Inf, 20.8, 26.3, 31.8, Inf),
+  labels = c("Greatly Increase Vulnerability", "Increase Vulnerability", "Somewhat Increase Vulnerability", "Neutral"),
+  right = FALSE
+)
+```
+
+Use dplyr to summarize.
+```{r}
+summary_table <- clipped_species_data %>%
+  group_by(Genus, temp_bin) %>%
+  summarise(count = n(), .groups = 'drop')
+
+summary_table
+```
+
+Now plot the rasters.
+```{r}
+ecoregion_extent <- st_bbox(specific_ecoregion)
+plot(temp_var_clipped, main = "Historical Temp Variation (C), Willamette Valley",ext = ecoregion_extent)
+plot(st_geometry(clipped_species_data), add = TRUE, col = 'red', pch = 16)
+```
+
+Extract raster values at species occurrence points
+```{r}
+temp_var_values <- raster::extract(temp_var_clipped, clipped_species_data)
+```
+
+Attach temp data to original species list.
+```{r}
+clipped_species_data$temp_var_values <- temp_var_values
+clipped_species_data$temp_var_values <- as.integer(clipped_species_data$temp_var_values)
+```
+
+Let's make precip maps for the reports.
+```{r}
+pvar.p <- rasterToPoints(precip_var_clipped)
+```
+
+```{r}
+df<-data.frame(pvar.p)
+colnames(df)<-c("Longitude", "Latitude", "tvar")
+```
+
+```{r}
+ggplot(data=df, aes(y=Latitude, x=Longitude)) +
+  geom_raster(aes(fill=tvar)) +
+  geom_point(data=subset(species_data, Genus == "Camassia"), aes(x=Longitude, y=Latitude), color="black", size=2, shape=20) +
+  theme_minimal() +
+  coord_equal() +
+ scale_fill_gradient(name="mean precip. var. (mm)", low="lightblue", high = "blue") +
+  ggtitle("Historical Precip. Variation, Camassia leichtlinii") +
+  theme(
+    axis.title.x = element_text(size=12),
+    axis.title.y = element_text(size=12, angle=90),
+    axis.text.x = element_text(size=12),
+    axis.text.y = element_text(size=12),
+     plot.background = element_rect(fill="white"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    legend.key = element_blank()
+  )
+```
+
+Now lets look at temperature change predictions.
+
+```{r}
+# Extract the temperature variation values and store them in a new object.
+temp_values_new <- raster::extract(temp_clipped, clipped_species_data)
+
+# Create a new dataframe to avoid modifying the original clipped_species_data.
+clipped_species_data_with_temp <- clipped_species_data %>%
+  mutate(temp_increase = as.numeric(temp_values_new))
+
+# Remove rows with NA values in the temperature variation column, storing the result in a new object.
+clipped_species_data_filtered <- clipped_species_data_with_temp %>%
+  filter(!is.na(temp_increase))
+
+# Create bins for temperature variation in a new column without modifying the original data.
+clipped_species_data_binned <- clipped_species_data_filtered %>%
+  mutate(temp_bin = cut(
+    temp_increase,
+    breaks = c(-Inf, 2.2, 2.4, 2.7, 3.1, 3.3, Inf),
+    labels = c("Very Low", "Low", "Moderate", "High", "Very High", "Extreme"),
+    right = FALSE
+  ))
+
+# Summarize the data and store the summary in a new object.
+summary_table_new <- clipped_species_data_binned %>%
+  group_by(Genus, temp_bin) %>%
+  summarise(count = n(), .groups = 'drop')
+
+# Display the new summary table.
+print(summary_table_new)
+```
+
+```{r}
+temp_clipped <- rasterToPoints(temp_clipped)
+```
+
+```{r}
+df_temp_clipped<-data.frame(temp_clipped)
+colnames(df_temp_clipped)<-c("Longitude", "Latitude", "temp")
+```
+
+Species data has already been created.
+
+Now we can plot each species on the raster using ggplot.
+```{r}
+ggplot(data=df_temp_clipped, aes(y=Latitude, x=Longitude)) +
+  geom_raster(aes(fill=temp)) +
+  geom_point(data=subset(species_data, Genus == "Thuja"), aes(x=Longitude, y=Latitude), color="black", size=2, shape=20) +
+  theme_minimal() +
+  coord_equal() +
+ scale_fill_gradient(name="Temp (°C)", low="yellow", high = "red") +
+  ggtitle("Predicted Temp in 2050, Salix lasiandra") +
+  theme(
+    axis.title.x = element_text(size=12),
+    axis.title.y = element_text(size=12, angle=90),
+    axis.text.x = element_text(size=12),
+    axis.text.y = element_text(size=12),
+     plot.background = element_rect(fill="white"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    legend.key = element_blank()
+  )
+```
+
+And for AET:PET or future precip.
+```{r}
+# Extract the AET:PET or future precipitation values and store them in a new object.
+AET_PET_values <- raster::extract(precip_clipped, clipped_species_data)
+
+# Create a new dataframe to avoid modifying the original clipped_species_data.
+clipped_species_data_with_precip <- clipped_species_data %>%
+  mutate(AET_PET = as.numeric(AET_PET_values))
+
+# Remove rows with NA values in the AET:PET or future precipitation column, storing the result in a new object.
+clipped_species_data_filtered <- clipped_species_data_with_precip %>%
+  filter(!is.na(AET_PET))
+
+clipped_species_data_binned <- clipped_species_data_filtered %>%
+  mutate(temp_bin = cut(
+    AET_PET,
+    breaks = c(-Inf, -0.119, -0.097, -0.074, -0.051, -0.028, Inf), 
+    labels = c("< -0.119", "-0.119 to -0.097", "-0.096 to -0.074", "-0.073 to -0.051", "-0.050 to -0.028", "> -0.028"),
+    include.lowest = TRUE,  # Ensures the first interval includes its lowest value
+    right = FALSE  # Ensures that the intervals are closed on the left and open on the right
+  ))
+
+# Summarize the data and store the summary in a new object.
+summary_table_AET <- clipped_species_data_binned %>%
+  group_by(Genus, temp_bin) %>%
+  summarise(count = n(), .groups = 'drop')
+
+# Display the new summary table.
+print(summary_table_AET)
+```
+
+```{r}
+precip_clipped_points<- rasterToPoints(precip_clipped)
+```
+
+```{r}
+df_precip_clipped<-data.frame(precip_clipped_points)
+colnames(df_precip_clipped)<-c("Longitude", "Latitude", "precip")
+```
+
+Species data has already been created.
+
+Now we can plot each species on the raster using ggplot.
+```{r}
+ggplot(data=df_precip_clipped, aes(y=Latitude, x=Longitude)) +
+  geom_raster(aes(fill=precip)) +
+  geom_point(data=subset(species_data, Genus == "Thuja"), aes(x=Longitude, y=Latitude), color="black", size=2, shape=20) +
+  theme_minimal() +
+  coord_equal() +
+ scale_fill_gradient(name="AET:PET", low="white", high = "blue") +
+  ggtitle("Predicted AET:PET in 2050, Salix lasiandra") +
+  theme(
+    axis.title.x = element_text(size=12),
+    axis.title.y = element_text(size=12, angle=90),
+    axis.text.x = element_text(size=12),
+    axis.text.y = element_text(size=12),
+     plot.background = element_rect(fill="white"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    legend.key = element_blank()
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+### EXTRA CODE
+state level climate look:
+```{r}
+state_mask <- rasterize(ecoregion, precip_var, field = 1)
+```
+
+```{r}
+state_moist_clipped <- mask(moist_annual, state_mask)
+state_precip_var <- mask(precip_var, state_mask)
+```
+
+```{r}
+state_extent <- st_bbox(ecoregion)
+plot(state_precip_var, ext = state_extent)
+```
+
