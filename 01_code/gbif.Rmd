@@ -66,14 +66,14 @@ specific_ecoregion_wkt <- st_as_text(st_union(st_geometry(specific_ecoregion)))
 
 Then we can get the taxon key and download the data.
 ```{r}
-taxonkey <- name_backbone("Tsuga heterophylla")$usageKey
+taxonkey <- name_backbone("Festuca roemeri")$usageKey # Change the species name here.
   
 
 gbif_download <- occ_download(
     pred("taxonKey", taxonkey),
     pred("hasCoordinate", TRUE), 
     pred("hasGeospatialIssue", FALSE), 
-    pred_within(specific_ecoregion_wkt), # This is the spatial filter
+    pred_within(specific_ecoregion_wkt), # This is the spatial filter.
     format = "SIMPLE_CSV"
   )
   
@@ -167,7 +167,7 @@ ggplot() +
 
 ## Save WV range as a shapefile.
 ```{r}
-st_write(species_range_polygon, here(data_dir,"Tsugadistribution.shp"), append=FALSE)
+st_write(species_range_polygon, here(data_dir,"FestucaDistribution.shp"), append=FALSE) # Change the output file name here.
 ```
 
 
